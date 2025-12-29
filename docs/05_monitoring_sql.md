@@ -1,84 +1,75 @@
-# 06. PostgreSQL 튜닝 가이드 
+# 05. PostgreSQL 인덱스 모니터링 가이드
 
-이 문서는 pgvector 벡터 인덱스 생성(IVFFlat, HNSW) 및  
-대규모 데이터 적재/평가 환경에서 PostgreSQL 성능을 최적화하기 위한  
-핵심 파라미터 설정 예시를 정리합니다.
-
-아래 설정은 postgresql.conf에서 할 수 있습니다.
+이 문서는 벡터 인덱스(IVFFlat, HNSW 등)의 생성 과정과  
+테이블/인덱스의 크기, 캐시 히트율을 점검하기 위해 사용할 수 있는  
+PostgreSQL 모니터링 SQL을 정리한 레퍼런스입니다.
 
 ------------------------------------------------------------
 
-## 1. 메모리 관련 설정
+## 1. 인덱스 생성 진행 상황 확인
 
-### shared_buffers
-PostgreSQL이 버퍼 풀로 사용하는 메모리 영역입니다.
-벡터 인덱스 조회 시 디스크 읽기를 줄이는 데 중요합니다.
+인덱스가 생성되는 동안 현재 진행률과 처리 블록 수, 처리된 튜플 수 등을 실시간으로 확인할 수 있습니다.
 
+```sql
+SELECT
+  now()::TIME(0),
+  a.query,
+  p.phase,
+  round(p.blocks_done / p.blocks_total::numeric * 100, 2) AS "% done",
+  p.blocks_total,
+  p.blocks_done,
+  p.tuples_total,
+  p.tuples_done,
+  ai.schemaname,
+  ai.relname,
+  ai.indexrelname
+FROM pg_stat_progress_create_index p
+JOIN pg_stat_activity a ON p.pid = a.pid
+LEFT JOIN pg_stat_all_indexes ai 
+  ON ai.relid = p.relid 
+ AND ai.indexrelid = p.index_relid;
 ```
-shared_buffers = 10GB
-```
----
 
-### maintenance_work_mem
-인덱스 생성에 사용되는 메모리입니다.
-IVFFlat/HNSW 인덱스 생성 속도에 직접적인 영향을 줍니다.
-```
-maintenance_work_mem = 10GB
-```
-가능한 한 크게 설정하면 인덱스 생성 속도가 향상됩니다.
+이 쿼리는 인덱스를 만들 때 특히 유용하며,  
+대규모 벡터 테이블에서 IVFFlat/HNSW 인덱싱 진행률을 확인하는 데 사용합니다.
 
 ------------------------------------------------------------
 
-## 2. 병렬 처리 관련 설정
+## 2. 테이블 및 인덱스 크기 점검
 
-대규모 인덱스 생성과 쿼리 병렬화를 위해 다음 세 파라미터를 함께 조정합니다.
+테이블과 인덱스의 실제 디스크 사용량을 확인할 수 있습니다.
 
+```sql
+SELECT 
+    relname AS relation,
+    pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
+    pg_size_pretty(pg_relation_size(relid)) AS relation_size,
+    pg_size_pretty(pg_indexes_size(relid)) AS indexes_size
+FROM pg_catalog.pg_statio_user_tables
+ORDER BY pg_total_relation_size(relid) DESC;
 ```
-max_worker_processes = 50
-max_parallel_workers = 50
-max_parallel_maintenance_workers = 50
-```
 
-세 값을 함께 크게 잡으면 인덱스 생성과 병렬 쿼리에 더 많은 CPU 코어를 활용할 수 있지만,  
-동시에 여러 작업이 돌아갈 경우 시스템 전체 부하도 크게 증가할 수 있으므로  
-실제 서버 사양(코어 수, 메모리 크기)에 맞춰 조정하는 것이 좋습니다.
+- total_size: 테이블 + 인덱스 전체 크기  
+- relation_size: 테이블 본체 크기  
+- indexes_size: 인덱스 크기  
 
-`iostat` 등의 명령어로 monitoring 하며 조절
+벡터 인덱스(list 수, HNSW 파라미터)에 따른 크기 변화를 모니터링할 때 유용합니다.
 
 ------------------------------------------------------------
 
-## 3. 포트 변경 및 서버 실행 방법
+## 3. 인덱스 캐시 히트율 (Index Cache Hit Ratio)
 
-PostgreSQL을 기본 포트(5432)와 격리된 환경에서 사용하기 위해 아래처럼 포트를 변경할 수 있습니다.
+PostgreSQL이 인덱스를 얼마나 메모리에서 처리하는지 확인하기 위한 히트율 지표입니다.
 
-```
-port = 5434
-```
-
-포트를 변경한 뒤에는 서버를 다음과 같이 실행합니다.
-
-```
-psql -p 5434 -d ann
-```
-
----
-
-## 4. 설정 적용 가이드
-
-1) postgresql.conf에 위 설정을 추가 또는 수정  
-2) PostgreSQL 재시작 
-
-예:
-
-```
-pg_ctl -D /path/to/pgdb restart
+```sql
+SELECT
+  indexrelname AS index_name,
+  idx_blks_hit,
+  idx_blks_read,
+  ROUND(100.0 * idx_blks_hit / NULLIF(idx_blks_hit + idx_blks_read, 0), 2) AS index_hit_ratio
+FROM pg_statio_user_indexes
+WHERE idx_blks_hit > 0
+ORDER BY index_hit_ratio DESC;
 ```
 
-3) 설정 확인:
-
-```
-SHOW shared_buffers;
-SHOW maintenance_work_mem;
-SHOW max_worker_processes;
-```
-------------------------------------------------------------
+- index_hit_ratio (%)가 높을수록 메모리 히트율이 좋아 조회 성능이 향상됩니다.
